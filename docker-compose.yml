@@ -1,0 +1,102 @@
+name: competitor-pulse
+
+# Inside compose, the app and migrations always reach Postgres at db:5432.
+# POSTGRES_HOST and POSTGRES_PORT in .env are for processes on the host.
+x-database-env: &database-env
+  POSTGRES_HOST: db
+  POSTGRES_PORT: '5432'
+  POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env, see .env.example}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env, see .env.example}
+  POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env, see .env.example}
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env, see .env.example}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env, see .env.example}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env, see .env.example}
+    ports:
+      # Localhost only, because .env.example has a well-known password.
+      - '127.0.0.1:${POSTGRES_PORT:?Set POSTGRES_PORT in .env, see .env.example}:5432'
+    # Docker's default 64 MB /dev/shm made a parallel VACUUM fail.
+    shm_size: 256mb
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Runs once and exits, so several app instances never race to apply migrations.
+  migrate:
+    build: .
+    restart: 'no'
+    command:
+      - node_modules/.bin/typeorm
+      - migration:run
+      - -d
+      - server/dist/src/database/data-source.js
+    environment:
+      <<: *database-env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  mock-llm:
+    image: python:3.12-slim
+    restart: unless-stopped
+    command: ['python', '/mock/mock-llm-server.py']
+    environment:
+      PYTHONUNBUFFERED: '1'
+    volumes:
+      - ./files/mock-llm/mock-llm-server.py:/mock/mock-llm-server.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4001/health', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    restart: unless-stopped
+    # Provider keys and other optional settings. The values below take priority.
+    env_file: .env
+    environment:
+      <<: *database-env
+      PORT: '3000'
+      WEB_DIST_DIR: /app/web/dist
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
+      CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-5}
+      MOCK_BASE_URL: http://mock-llm:4001/v1
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      mock-llm:
+        condition: service_healthy
+    # Longer than the 30s LLM timeout, so a stop can finish calls in progress.
+    stop_grace_period: 40s
+    healthcheck:
+      # Its own limit, so a stuck request can't outlast the check.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/healthz',{signal:AbortSignal.timeout(3000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  db-data:
